@@ -464,7 +464,8 @@ static int load_contents(struct snapshot *snapshot)
 {
 	int fd;
 	struct stat st;
-	size_t size, bytes_read;
+	size_t size;
+	ssize_t bytes_read;
 
 	fd = open(snapshot->refs->path, O_RDONLY);
 	if (fd < 0) {
