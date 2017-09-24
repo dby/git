@@ -11,6 +11,7 @@
 #include "string-list.h"
 #include "sha1-array.h"
 #include "transport.h"
+#include "protocol.h"
 
 static char *server_capabilities;
 static const char *parse_feature_value(const char *, const char *, int *);
@@ -124,10 +125,11 @@ struct ref **get_remote_heads(int in, char *src_buf, size_t src_len,
 	 * response does not necessarily mean an ACL problem, though.
 	 */
 	int saw_response;
+	int seen_ref;
 	int got_dummy_ref_with_capabilities_declaration = 0;
 
 	*list = NULL;
-	for (saw_response = 0; ; saw_response = 1) {
+	for (saw_response = 0, seen_ref = 0; ; saw_response = 1) {
 		struct ref *ref;
 		struct object_id old_oid;
 		char *name;
@@ -141,6 +143,27 @@ struct ref **get_remote_heads(int in, char *src_buf, size_t src_len,
 				  PACKET_READ_CHOMP_NEWLINE);
 		if (len < 0)
 			die_initial_contact(saw_response);
+
+		/* Only check for version information on first response */
+		if (!saw_response) {
+			switch (determine_protocol_version_client(buffer)) {
+			case protocol_v1:
+				/*
+				 * First pkt-line contained the version string.
+				 * Continue on to process the ref advertisement.
+				 */
+				continue;
+			case protocol_v0:
+				/*
+				 * Server is speaking protocol v0 and sent a
+				 * ref so we need to process it.
+				 */
+				break;
+			default:
+				die("server is speaking an unknown protocol");
+				break;
+			}
+		}
 
 		if (!len)
 			break;
@@ -165,6 +188,8 @@ struct ref **get_remote_heads(int in, char *src_buf, size_t src_len,
 
 		name_len = strlen(name);
 		if (len != name_len + GIT_SHA1_HEXSZ + 1) {
+			if (seen_ref)
+				; /* NEEDSWORK: Error out for multiple capabilities lines? */
 			free(server_capabilities);
 			server_capabilities = xstrdup(name + name_len + 1);
 		}
@@ -175,7 +200,7 @@ struct ref **get_remote_heads(int in, char *src_buf, size_t src_len,
 		}
 
 		if (!strcmp(name, "capabilities^{}")) {
-			if (saw_response)
+			if (seen_ref)
 				die("protocol error: unexpected capabilities^{}");
 			if (got_dummy_ref_with_capabilities_declaration)
 				die("protocol error: multiple capabilities^{}");
@@ -193,6 +218,7 @@ struct ref **get_remote_heads(int in, char *src_buf, size_t src_len,
 		oidcpy(&ref->old_oid, &old_oid);
 		*list = ref;
 		list = &ref->next;
+		seen_ref = 1;
 	}
 
 	annotate_refs_with_symref_info(*orig_list);
@@ -792,6 +818,7 @@ struct child_process *git_connect(int fd[2], const char *url,
 		printf("Diag: path=%s\n", path ? path : "NULL");
 		conn = NULL;
 	} else if (protocol == PROTO_GIT) {
+		struct strbuf request = STRBUF_INIT;
 		/*
 		 * Set up virtual host information based on where we will
 		 * connect, unless the user has overridden us in
@@ -819,13 +846,25 @@ struct child_process *git_connect(int fd[2], const char *url,
 		 * Note: Do not add any other headers here!  Doing so
 		 * will cause older git-daemon servers to crash.
 		 */
-		packet_write_fmt(fd[1],
-			     "%s %s%chost=%s%c",
-			     prog, path, 0,
-			     target_host, 0);
+		strbuf_addf(&request,
+			    "%s %s%chost=%s%c",
+			    prog, path, 0,
+			    target_host, 0);
+
+		/* If using a new version put that stuff here after a second null byte */
+		if (get_protocol_version_config() > 0) {
+			strbuf_addch(&request, '\0');
+			strbuf_addf(&request, "version=%d%c",
+				    get_protocol_version_config(), '\0');
+		}
+
+		packet_write(fd[1], request.buf, request.len);
+
 		free(target_host);
+		strbuf_release(&request);
 	} else {
 		struct strbuf cmd = STRBUF_INIT;
+		const char *const *var;
 
 		conn = xmalloc(sizeof(*conn));
 		child_process_init(conn);
@@ -838,7 +877,9 @@ struct child_process *git_connect(int fd[2], const char *url,
 		sq_quote_buf(&cmd, path);
 
 		/* remove repo-local variables from the environment */
-		conn->env = local_repo_env;
+		for (var = local_repo_env; *var; var++)
+			argv_array_push(&conn->env_array, *var);
+
 		conn->use_shell = 1;
 		conn->in = conn->out = -1;
 		if (protocol == PROTO_SSH) {
@@ -892,6 +933,14 @@ struct child_process *git_connect(int fd[2], const char *url,
 			}
 
 			argv_array_push(&conn->args, ssh);
+
+			if (get_protocol_version_config() > 0) {
+				argv_array_push(&conn->args, "-o");
+				argv_array_push(&conn->args, "SendEnv=" GIT_PROTOCOL_ENVIRONMENT);
+				argv_array_pushf(&conn->env_array, GIT_PROTOCOL_ENVIRONMENT "=version=%d",
+						 get_protocol_version_config());
+			}
+
 			if (flags & CONNECT_IPV4)
 				argv_array_push(&conn->args, "-4");
 			else if (flags & CONNECT_IPV6)
@@ -906,6 +955,10 @@ struct child_process *git_connect(int fd[2], const char *url,
 			argv_array_push(&conn->args, ssh_host);
 		} else {
 			transport_check_allowed("file");
+			if (get_protocol_version_config() > 0) {
+				argv_array_pushf(&conn->env_array, GIT_PROTOCOL_ENVIRONMENT "=version=%d",
+						 get_protocol_version_config());
+			}
 		}
 		argv_array_push(&conn->args, cmd.buf);
 
